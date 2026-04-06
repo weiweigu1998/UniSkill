@@ -379,6 +379,12 @@ def parse_args(input_args=None):
         help="The dataset to use for training.",
     )
     parser.add_argument(
+        "--data_path",
+        type=str,
+        default=None,
+        help="Path to dataset directory. Overrides the dataset class default.",
+    )
+    parser.add_argument(
         "--train_scheduler",
         type=str,
         default="ddpm",
@@ -569,6 +575,7 @@ def make_dataset(dataset_name, args, depth_processor, train=True):
         "droid": DroidDataset,
         "libero": LIBERODataset,
         "bridge": BridgeDataset,
+        "action_bench": ActionBenchDataset,
         "combined": CombinedDataset,
     }
 
@@ -576,26 +583,27 @@ def make_dataset(dataset_name, args, depth_processor, train=True):
     if dataset_class is None:
         raise ValueError(f"Unknown dataset name: {dataset_name}")
 
+    common_kwargs = dict(
+        train=train,
+        resolution=args.resolution,
+        depth_processor=depth_processor,
+    )
+    if getattr(args, "data_path", None) is not None:
+        common_kwargs["data_path"] = args.data_path
+
     if dataset_name == "combined":
+        common_kwargs.pop("data_path", None)
         return dataset_class(
-            train=train,
-            resolution=args.resolution,
-            depth_processor=depth_processor,
+            **common_kwargs,
             datasets=["droid", "libero", "bridge", "sthsthv2", "h2o"],
         )
     elif dataset_name == "xskill":
         return dataset_class(
-            train=train,
-            resolution=args.resolution,
-            depth_processor=depth_processor,
+            **common_kwargs,
             unseen_type="human",
         )
     else:
-        return dataset_class(
-            train=train,
-            resolution=args.resolution,
-            depth_processor=depth_processor,
-        )
+        return dataset_class(**common_kwargs)
 
 def collate_fn(examples):
     curr_images = torch.stack([example["curr_images"] for example in examples])
@@ -1138,7 +1146,7 @@ def main(args):
         unet = accelerator.unwrap_model(unet)
         unet.save_pretrained(args.output_dir)
         idm = accelerator.unwrap_model(idm)
-        idm.save_pretrained(args.output_dir)
+        torch.save(idm.state_dict(), os.path.join(args.output_dir, "idm.pth"))
 
         if args.push_to_hub:
             upload_folder(
