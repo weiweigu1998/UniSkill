@@ -5,5 +5,6 @@ from .xskill_dataset import XSkillDataset
 from .sthsthv2 import SthSthv2Dataset
 from .h2o_dataset import H2ODataset
 from .bridge_dataset import BridgeDataset
+from .lfo_benchmark_dataset import LfOBenchmarkDataset
 
 from .combined_dataset import CombinedDataset

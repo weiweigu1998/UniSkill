@@ -401,6 +401,18 @@ def parse_args(input_args=None):
         action="store_true",
         help=("Use classifier-free guidance."),
     )
+    parser.add_argument(
+        "--lfo_config",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON file holding the LfO-benchmark dataset selection "
+            "(used when --dataset_name lfo_benchmark). The script reads the "
+            "``lfo`` subkey for selection knobs: tasks, robot_cameras, "
+            "human_cameras, num_robot_demos_per_task, num_human_demos_per_task, "
+            "human_distract."
+        ),
+    )
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -576,6 +588,7 @@ def make_dataset(dataset_name, args, depth_processor, train=True):
         "libero": LIBERODataset,
         "bridge": BridgeDataset,
         "action_bench": ActionBenchDataset,
+        "lfo_benchmark": LfOBenchmarkDataset,
         "combined": CombinedDataset,
     }
 
@@ -602,6 +615,14 @@ def make_dataset(dataset_name, args, depth_processor, train=True):
             **common_kwargs,
             unseen_type="human",
         )
+    elif dataset_name == "lfo_benchmark":
+        lfo_kwargs = {}
+        if getattr(args, "lfo_config", None):
+            import json as _json
+            with open(args.lfo_config) as f:
+                cfg = _json.load(f)
+            lfo_kwargs = cfg.get("lfo", cfg)
+        return dataset_class(**common_kwargs, **lfo_kwargs)
     else:
         return dataset_class(**common_kwargs)
 
