@@ -14,7 +14,7 @@ import torch.multiprocessing as mp
 import time
 import torch.nn.functional as F
 from concurrent.futures import ThreadPoolExecutor
-from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+from transformers import AutoModelForDepthEstimation
 
 from dynamics.idm import IDM
 
@@ -222,12 +222,35 @@ def to_numpy_frames(sequence: Sequence, camera_key: str) -> np.ndarray:
     return frames
 
 
+# ImageNet statistics — the normalization Depth-Anything-V2 expects, and the
+# same stats the IDM training pipeline applied (depth_processor after a [0,1]
+# ToTensor). Depth preprocessing is done on-GPU here; the previous CPU
+# AutoImageProcessor path dominated wall time (~25 s/batch vs ~0.9 s GPU).
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
+_DEPTH_INPUT_SIZE = 518  # Depth-Anything-V2 native resolution.
+
+
+def _depth_pixel_values(rgb01: torch.Tensor) -> torch.Tensor:
+    """[0,1] RGB (B,3,H,W) on GPU → Depth-Anything pixel_values (B,3,518,518).
+
+    Matches the IDM training pipeline (``idm_image_transforms`` ends in
+    ``ToTensor`` → [0,1], then ``depth_processor(..., do_rescale=False)``):
+    bicubic-resize to the depth model's native resolution, ImageNet-normalize.
+    """
+    device = rgb01.device
+    x = F.interpolate(rgb01, size=(_DEPTH_INPUT_SIZE, _DEPTH_INPUT_SIZE),
+                      mode="bicubic", align_corners=False).clamp_(0.0, 1.0)
+    mean = torch.tensor(_IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(_IMAGENET_STD, device=device).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+
 def extract_latents_for_demo(
     frames: np.ndarray,
     *,
     idm: torch.nn.Module,
     idm_resolution: int,
-    depth_processor: AutoImageProcessor,
     depth_estimator: torch.nn.Module,
     device: torch.device,
     batch_size: int,
@@ -266,16 +289,9 @@ def extract_latents_for_demo(
             curr_tensor = curr_tensor.pin_memory()
             next_tensor = next_tensor.pin_memory()
 
-        depth_inputs = [frames[idx] for idx in curr_indices] + [frames[idx] for idx in next_indices]
-        depth_batch = depth_processor(
-            images=depth_inputs,
-            do_rescale=False,
-            return_tensors="pt",
-        )
-        if pin_memory:
-            depth_batch = {k: v.pin_memory() for k, v in depth_batch.items()}
-
-        return curr_tensor, next_tensor, depth_batch
+        # Depth preprocessing (resize to 518² + ImageNet-normalize) is done
+        # on-GPU in the main loop from these [0,1] tensors — no CPU processor.
+        return curr_tensor, next_tensor
 
     executor = ThreadPoolExecutor(max_workers=prefetch_workers) if prefetch_workers > 0 else None
 
@@ -292,28 +308,30 @@ def extract_latents_for_demo(
             end = min(start + batch_size, num_pairs)
             if executor is not None:
                 next_future = submit(end) if end < num_pairs else None
-                curr_tensor, next_tensor, depth_batch = future.result()
+                curr_tensor, next_tensor = future.result()
             else:
-                curr_tensor, next_tensor, depth_batch = submit(start)
+                curr_tensor, next_tensor = submit(start)
                 next_future = None
 
+            # [0,1] RGB on GPU, shared by the visual and depth paths.
+            curr_dev = curr_tensor.to(device, non_blocking=True)
+            next_dev = next_tensor.to(device, non_blocking=True)
+
             visual_curr = F.interpolate(
-                curr_tensor.to(device, non_blocking=True),
-                size=(idm_resolution, idm_resolution),
-                mode="bilinear",
-                align_corners=False,
+                curr_dev, size=(idm_resolution, idm_resolution),
+                mode="bilinear", align_corners=False,
             )
             visual_next = F.interpolate(
-                next_tensor.to(device, non_blocking=True),
-                size=(idm_resolution, idm_resolution),
-                mode="bilinear",
-                align_corners=False,
+                next_dev, size=(idm_resolution, idm_resolution),
+                mode="bilinear", align_corners=False,
             )
             visual_pair = torch.stack([visual_curr, visual_next], dim=1)
 
-            depth_batch = {k: v.to(device, non_blocking=True) for k, v in depth_batch.items()}
+            # Depth-model RGB input: [0,1] → 518² → ImageNet-normalize, on GPU.
+            depth_pixel_values = torch.cat(
+                [_depth_pixel_values(curr_dev), _depth_pixel_values(next_dev)], dim=0)
             with torch.cuda.amp.autocast(enabled=autocast_enabled):
-                depth_outputs = depth_estimator(**depth_batch)
+                depth_outputs = depth_estimator(pixel_values=depth_pixel_values)
                 depth_outputs = get_predicted_depth(depth_outputs)
                 if depth_outputs.ndim == 4 and depth_outputs.size(1) == 1:
                     depth_outputs = depth_outputs.squeeze(1)
@@ -350,7 +368,6 @@ def process_demonstration_file(
     *,
     args: argparse.Namespace,
     idm: torch.nn.Module,
-    depth_processor: AutoImageProcessor,
     depth_estimator: torch.nn.Module,
     device: torch.device,
     skill_dim: int,
@@ -377,7 +394,6 @@ def process_demonstration_file(
             frames,
             idm=idm,
             idm_resolution=args.idm_resolution,
-            depth_processor=depth_processor,
             depth_estimator=depth_estimator,
             device=device,
             batch_size=args.batch_size,
@@ -408,7 +424,6 @@ def run_extraction_on_device(
         torch.backends.cudnn.benchmark = True
 
     idm, skill_dim = load_idm(args, device)
-    depth_processor = AutoImageProcessor.from_pretrained(args.depth_model)
     depth_estimator = load_depth_estimator(args.depth_model, device)
 
     iterator: Iterable[Path]
@@ -430,7 +445,6 @@ def run_extraction_on_device(
             path_obj,
             args=args,
             idm=idm,
-            depth_processor=depth_processor,
             depth_estimator=depth_estimator,
             device=device,
             skill_dim=skill_dim,
