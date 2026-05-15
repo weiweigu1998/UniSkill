@@ -1,10 +1,10 @@
 """LfO Benchmark dataset for UniSkill — mixes robot trajectories (read from
-the new ``pi05_samples`` per-sample pkl format) with human demonstration
+the new ``postprocessed_robot_trajectories`` per-sample pkl format) with human demonstration
 videos (read from the original ``raw_video_demonstrations`` mp4s).
 
 Sources::
 
-    Robot:  <data_path>/pi05_samples/data/<idx>.pkl  +  meta/{stats.json,
+    Robot:  <data_path>/postprocessed_robot_trajectories/data/<idx>.pkl  +  meta/{stats.json,
             index.jsonl}                             # one frame per pkl,
                                                       # pre-resized to 224²
             ↑ produced by scripts/process_training_trajectories.py
@@ -15,11 +15,11 @@ Sources::
             cameras: {egocentric, front, left, right}
 
 Frame pairs (curr, next) are sampled per-demo: for the robot side we group
-the sample indices by (task, demo_id) — using ``pi05_samples/meta/index.jsonl``
+the sample indices by (task, demo_id) — using ``postprocessed_robot_trajectories/meta/index.jsonl``
 — and treat each group as a virtual trajectory of length ``len(group)``.
 ``read_images_entry`` then loads the curr/next pkls and pulls ``observation/<cam>``
 out of each. For the human side we still decode the mp4 with decord exactly
-like before, since human demos don't go through pi05_samples.
+like before, since human demos don't go through postprocessed_robot_trajectories.
 
 This swap drops the dependency on ``h5_training_trajectories/`` entirely: the
 UniSkill IDM trainer can run against the same pkl artefacts the Pi0.5 trainer
@@ -48,7 +48,7 @@ from decord import VideoReader, cpu
 from .base_dataset import BaseDataset
 
 #: Subdirectory holding the new per-sample pkl format.
-ROBOT_SAMPLES_SUBDIR = "pi05_samples"
+ROBOT_SAMPLES_SUBDIR = "postprocessed_robot_trajectories"
 #: Subdirectory holding raw human demonstration videos.
 HUMAN_SUBDIR = "raw_video_demonstrations"
 #: Human-demo distraction sub-bucket: True picks ``with_distraction/``.
@@ -63,7 +63,7 @@ class LfOBenchmarkDataset(BaseDataset):
     """Frame-pair dataset over (robot trajectories ∪ human demonstration videos).
 
     Args:
-        data_path: Root holding ``pi05_samples/`` and ``raw_video_demonstrations/``.
+        data_path: Root holding ``postprocessed_robot_trajectories/`` and ``raw_video_demonstrations/``.
         tasks: Tasks to include. ``None`` = intersection of tasks present in both sources.
         robot_cameras: Cameras to read from each robot pkl (each pkl must carry
             ``observation/<cam>`` for every listed camera).
@@ -127,7 +127,7 @@ class LfOBenchmarkDataset(BaseDataset):
         self.image_pair = _split(robot_entries, self.train) + _split(human_entries, self.train)
 
     def _load_robot_sample_index(self, robot_samples_root: Path) -> dict[str, dict[str, list[int]]]:
-        """Read ``pi05_samples/meta/index.jsonl`` and group sample idxs by
+        """Read ``postprocessed_robot_trajectories/meta/index.jsonl`` and group sample idxs by
         ``(task, demo_id)``. Returns ``{task: {demo_id: [sorted sample_idx, ...]}}``.
 
         Each line of ``index.jsonl`` is ``{"idx", "task", "demo_id", "t"}``.
@@ -138,7 +138,7 @@ class LfOBenchmarkDataset(BaseDataset):
         index_path = robot_samples_root / "meta" / "index.jsonl"
         if not index_path.is_file():
             raise FileNotFoundError(
-                f"Expected pi05_samples meta/index.jsonl at {index_path}. "
+                f"Expected postprocessed_robot_trajectories meta/index.jsonl at {index_path}. "
                 f"Run `scripts/process_training_trajectories.py --pi05-samples` "
                 f"first to materialize the per-sample pkl dataset."
             )
