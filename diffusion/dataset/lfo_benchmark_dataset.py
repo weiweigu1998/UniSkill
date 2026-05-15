@@ -1,37 +1,54 @@
-"""LfO Benchmark dataset for UniSkill — mixes robot trajectories and human videos.
+"""LfO Benchmark dataset for UniSkill — mixes robot trajectories (read from
+the new ``pi05_samples`` per-sample pkl format) with human demonstration
+videos (read from the original ``raw_video_demonstrations`` mp4s).
 
-Reads two heterogeneous sources from the action_understanding_bench LfO layout:
+Sources::
 
-    Robot:  <data_path>/h5_training_trajectories/<task>/<demo>/<ts>.h5
-            key = traj_0/obs/sensor_data/<camera>/rgb,  shape (T, 512, 512, 3) uint8
-            cameras: {base, hand, left, overhead, right}_camera
+    Robot:  <data_path>/pi05_samples/data/<idx>.pkl  +  meta/{stats.json,
+            index.jsonl}                             # one frame per pkl,
+                                                      # pre-resized to 224²
+            ↑ produced by scripts/process_training_trajectories.py
+              with --pi05-samples. Each pkl carries one robot timestep's
+              observation/<camera> (HWC uint8) plus state/actions metadata.
 
     Human:  <data_path>/raw_video_demonstrations/<distract>/<task>/<demo>/<camera>.mp4
-            cameras: {egocentric, front, left, right} at 720x1280 uint8
+            cameras: {egocentric, front, left, right}
+
+Frame pairs (curr, next) are sampled per-demo: for the robot side we group
+the sample indices by (task, demo_id) — using ``pi05_samples/meta/index.jsonl``
+— and treat each group as a virtual trajectory of length ``len(group)``.
+``read_images_entry`` then loads the curr/next pkls and pulls ``observation/<cam>``
+out of each. For the human side we still decode the mp4 with decord exactly
+like before, since human demos don't go through pi05_samples.
+
+This swap drops the dependency on ``h5_training_trajectories/`` entirely: the
+UniSkill IDM trainer can run against the same pkl artefacts the Pi0.5 trainer
+consumes, and only the timesteps we actually visit per __getitem__ pay disk
+I/O (one pickle load per frame, not a whole-trajectory h5 read).
 
 ``BaseDataset.image_transforms`` resizes everything to ``resolution`` so the
 two source resolutions are fine to mix. Selection is config-driven so callers
 can pick a task list, a per-source camera list, and a per-source demo cap.
 The 90/10 train/val split is applied **independently per source** so the
 validation set also has both robot and human frames.
-
-The IDM/FSD training loop expects ``self.image_pair`` to be a list of dicts
-with ``path`` and ``length``. Here each entry additionally carries ``source``
-(``"robot"`` or ``"human"``) and ``camera``; the overridden ``__getitem__``
-threads the full entry into ``read_images`` so it can dispatch on source.
 """
 
-import os
-import random
+from __future__ import annotations
 
-import h5py
+import json
+import os
+import pickle
+import random
+from collections import defaultdict
+from pathlib import Path
+
 from PIL import Image
 from decord import VideoReader, cpu
 
 from .base_dataset import BaseDataset
 
-#: Subdirectory holding processed sensor_data-mode robot trajectories.
-ROBOT_SUBDIR = "h5_training_trajectories"
+#: Subdirectory holding the new per-sample pkl format.
+ROBOT_SAMPLES_SUBDIR = "pi05_samples"
 #: Subdirectory holding raw human demonstration videos.
 HUMAN_SUBDIR = "raw_video_demonstrations"
 #: Human-demo distraction sub-bucket: True picks ``with_distraction/``.
@@ -46,9 +63,10 @@ class LfOBenchmarkDataset(BaseDataset):
     """Frame-pair dataset over (robot trajectories ∪ human demonstration videos).
 
     Args:
-        data_path: Root holding ``h5_training_trajectories/`` and ``raw_video_demonstrations/``.
+        data_path: Root holding ``pi05_samples/`` and ``raw_video_demonstrations/``.
         tasks: Tasks to include. ``None`` = intersection of tasks present in both sources.
-        robot_cameras: Cameras to load from robot trajectories.
+        robot_cameras: Cameras to read from each robot pkl (each pkl must carry
+            ``observation/<cam>`` for every listed camera).
         human_cameras: Cameras to load from human videos.
         num_robot_demos_per_task: Cap on robot demos per task (after sort). ``None`` = all.
         num_human_demos_per_task: Cap on human demos per task (after sort). ``None`` = all.
@@ -80,57 +98,92 @@ class LfOBenchmarkDataset(BaseDataset):
         kwargs.setdefault("max_predict_future_horizon", 30)
         super().__init__(data_path, **kwargs)
 
-    def _prepare_data(self, data_path):
-        robot_root = os.path.join(data_path, ROBOT_SUBDIR)
-        human_root = os.path.join(data_path, HUMAN_SUBDIR, HUMAN_DISTRACT_DIRS[self.human_distract])
+    # ------------------------------------------------------------------
+    # _prepare_data — build self.image_pair across robot + human sources.
+    # ------------------------------------------------------------------
 
-        # Resolve task set: intersection of tasks present in both sources by default.
-        robot_tasks = _list_subdirs(robot_root)
+    def _prepare_data(self, data_path):
+        robot_samples_root = Path(data_path) / ROBOT_SAMPLES_SUBDIR
+        human_root = Path(data_path) / HUMAN_SUBDIR / HUMAN_DISTRACT_DIRS[self.human_distract]
+
+        robot_index = self._load_robot_sample_index(robot_samples_root)
+        robot_tasks = set(robot_index.keys())
         human_tasks = _list_subdirs(human_root)
+
         if self.tasks is None:
-            tasks = sorted(set(robot_tasks) & set(human_tasks))
+            tasks = sorted(robot_tasks & human_tasks)
         else:
             tasks = list(self.tasks)
         if not tasks:
             raise ValueError(
-                f"No tasks resolved. robot_root={robot_root!r} has {sorted(robot_tasks)}, "
-                f"human_root={human_root!r} has {sorted(human_tasks)}."
+                f"No tasks resolved. robot_samples_root={robot_samples_root!r} has "
+                f"{sorted(robot_tasks)}, human_root={human_root!r} has {sorted(human_tasks)}."
             )
 
-        robot_entries = self._scan_robot(robot_root, tasks)
+        robot_entries = self._scan_robot(robot_samples_root, robot_index, tasks)
         human_entries = self._scan_human(human_root, tasks)
 
         # Per-source 90/10 train/val split so val has both sources.
         self.image_pair = _split(robot_entries, self.train) + _split(human_entries, self.train)
 
-    def _scan_robot(self, robot_root, tasks):
+    def _load_robot_sample_index(self, robot_samples_root: Path) -> dict[str, dict[str, list[int]]]:
+        """Read ``pi05_samples/meta/index.jsonl`` and group sample idxs by
+        ``(task, demo_id)``. Returns ``{task: {demo_id: [sorted sample_idx, ...]}}``.
+
+        Each line of ``index.jsonl`` is ``{"idx", "task", "demo_id", "t"}``.
+        Within a demo, the time-axis index ``t`` is contiguous from 0 to
+        ``len(group) - 1`` (the preprocessor walks demos in t order), so the
+        sample-idx list is already ordered chronologically.
+        """
+        index_path = robot_samples_root / "meta" / "index.jsonl"
+        if not index_path.is_file():
+            raise FileNotFoundError(
+                f"Expected pi05_samples meta/index.jsonl at {index_path}. "
+                f"Run `scripts/process_training_trajectories.py --pi05-samples` "
+                f"first to materialize the per-sample pkl dataset."
+            )
+        groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        with open(index_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                groups[entry["task"]][entry["demo_id"]].append(int(entry["idx"]))
+        # Sort the per-demo idx lists so the group represents (t=0, t=1, …).
+        for task, demos in groups.items():
+            for demo_id, idxs in demos.items():
+                demos[demo_id] = sorted(idxs)
+        return groups
+
+    def _scan_robot(self, robot_samples_root: Path, index: dict, tasks):
+        """One ``image_pair`` entry per (demo, camera). ``path`` is the demo's
+        absolute pkl directory, ``length`` is the number of sample pkls in it,
+        and ``camera`` selects which ``observation/<cam>`` key to slice at
+        __getitem__ time.
+        """
         out = []
+        data_dir = robot_samples_root / "data"
         for task in tasks:
-            task_dir = os.path.join(robot_root, task)
-            if not os.path.isdir(task_dir):
-                continue
-            demo_names = sorted(d for d in os.listdir(task_dir) if os.path.isdir(os.path.join(task_dir, d)))
+            demos = index.get(task, {})
+            demo_ids_sorted = sorted(demos.keys())
             if self.num_robot_demos_per_task is not None:
-                demo_names = demo_names[: self.num_robot_demos_per_task]
-            for demo in demo_names:
-                demo_dir = os.path.join(task_dir, demo)
-                h5_files = [f for f in sorted(os.listdir(demo_dir)) if f.endswith(".h5") and ".state." not in f]
-                if not h5_files:
+                demo_ids_sorted = demo_ids_sorted[: self.num_robot_demos_per_task]
+            for demo_id in demo_ids_sorted:
+                sample_idxs = demos[demo_id]
+                T = len(sample_idxs)
+                if T < self.min_predict_future_horizon:
                     continue
-                h5_path = os.path.join(demo_dir, h5_files[0])
-                try:
-                    with h5py.File(h5_path, "r") as f:
-                        per_cam_len = {}
-                        for cam in self.robot_cameras:
-                            key = f"traj_0/obs/sensor_data/{cam}/rgb"
-                            if key in f:
-                                per_cam_len[cam] = int(f[key].shape[0])
-                except (OSError, KeyError):
-                    continue
-                for cam, T in per_cam_len.items():
-                    if T < self.min_predict_future_horizon:
-                        continue
-                    out.append({"path": h5_path, "length": T, "source": "robot", "camera": cam})
+                for cam in self.robot_cameras:
+                    out.append({
+                        "path": str(data_dir),
+                        "length": T,
+                        "source": "robot",
+                        "camera": cam,
+                        "task": task,
+                        "demo_id": demo_id,
+                        "sample_idxs": sample_idxs,
+                    })
         return out
 
     def _scan_human(self, human_root, tasks):
@@ -139,7 +192,9 @@ class LfOBenchmarkDataset(BaseDataset):
             task_dir = os.path.join(human_root, task)
             if not os.path.isdir(task_dir):
                 continue
-            demo_names = sorted(d for d in os.listdir(task_dir) if os.path.isdir(os.path.join(task_dir, d)))
+            demo_names = sorted(
+                d for d in os.listdir(task_dir) if os.path.isdir(os.path.join(task_dir, d))
+            )
             if self.num_human_demos_per_task is not None:
                 demo_names = demo_names[: self.num_human_demos_per_task]
             for demo in demo_names:
@@ -157,11 +212,16 @@ class LfOBenchmarkDataset(BaseDataset):
                     out.append({"path": mp4, "length": int(T), "source": "human", "camera": cam})
         return out
 
+    # ------------------------------------------------------------------
+    # __getitem__ / read_images — same shape as BaseDataset's loop but
+    # threads the full image_pair entry through ``read_images_entry`` so
+    # it can dispatch on ``source``.
+    # ------------------------------------------------------------------
+
     def __getitem__(self, idx):
         entry = self.image_pair[idx]
         video_len = entry["length"]
 
-        # Same horizon sampling as ``BaseDataset.__getitem__``.
         while True:
             predict_future_horizon = random.randint(
                 self.min_predict_future_horizon, self.max_predict_future_horizon
@@ -197,10 +257,15 @@ class LfOBenchmarkDataset(BaseDataset):
 
     def read_images_entry(self, entry, prev_idx, next_idx):
         if entry["source"] == "robot":
-            with h5py.File(entry["path"], "r") as f:
-                rgb = f[f"traj_0/obs/sensor_data/{entry['camera']}/rgb"]
-                curr = rgb[prev_idx]
-                nxt = rgb[next_idx]
+            sample_idxs = entry["sample_idxs"]
+            data_dir = Path(entry["path"])
+            cam = entry["camera"]
+            curr_pkl = data_dir / f"{sample_idxs[prev_idx]}.pkl"
+            next_pkl = data_dir / f"{sample_idxs[next_idx]}.pkl"
+            with open(curr_pkl, "rb") as f:
+                curr = pickle.load(f)[f"observation/{cam}"]
+            with open(next_pkl, "rb") as f:
+                nxt = pickle.load(f)[f"observation/{cam}"]
         elif entry["source"] == "human":
             vr = VideoReader(entry["path"], ctx=cpu(0))
             curr = vr[prev_idx].asnumpy()
@@ -211,14 +276,15 @@ class LfOBenchmarkDataset(BaseDataset):
 
 
 def _list_subdirs(root):
+    root = str(root)
     if not os.path.isdir(root):
         return set()
     return {p for p in os.listdir(root) if os.path.isdir(os.path.join(root, p))}
 
 
 def _split(entries, train):
-    """90/10 train/val split. Operates on a flat list sorted by (task, demo, camera)
-    via the sort already applied during scan, so the split is deterministic."""
+    """90/10 train/val split. Operates on a flat list already sorted by scan
+    order so the split is deterministic across processes."""
     n = len(entries)
     cut = int(n * 0.9)
     return entries[:cut] if train else entries[cut:]
