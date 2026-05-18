@@ -410,7 +410,7 @@ def parse_args(input_args=None):
             "(used when --dataset_name lfo_benchmark). The script reads the "
             "``lfo`` subkey for selection knobs: tasks, robot_cameras, "
             "human_cameras, num_robot_demos_per_task, num_human_demos_per_task, "
-            "human_distract."
+            "include_video_types."
         ),
     )
     if input_args is not None:

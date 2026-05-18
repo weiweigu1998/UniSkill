@@ -51,8 +51,8 @@ from .base_dataset import BaseDataset
 ROBOT_SAMPLES_SUBDIR = "postprocessed_robot_trajectories"
 #: Subdirectory holding raw human demonstration videos.
 HUMAN_SUBDIR = "raw_video_demonstrations"
-#: Human-demo distraction sub-bucket: True picks ``with_distraction/``.
-HUMAN_DISTRACT_DIRS = {True: "with_distraction", False: "without_distraction"}
+#: Human-demo distraction sub-buckets selectable via ``include_video_types``.
+VALID_VIDEO_TYPES = ("without_distraction", "with_distraction")
 
 #: Cameras available for each source — used only for friendlier error messages.
 ROBOT_CAMERAS = ("base_camera", "hand_camera", "left_camera", "overhead_camera", "right_camera")
@@ -69,8 +69,12 @@ class LfOBenchmarkDataset(BaseDataset):
             ``observation/<cam>`` for every listed camera).
         human_cameras: Cameras to load from human videos.
         num_robot_demos_per_task: Cap on robot demos per task (after sort). ``None`` = all.
-        num_human_demos_per_task: Cap on human demos per task (after sort). ``None`` = all.
-        human_distract: ``True`` for ``with_distraction/`` videos, ``False`` for ``without_distraction/``.
+        num_human_demos_per_task: Cap on human demos per task **per video type**
+            (after sort). ``None`` = all.
+        include_video_types: Human-demo distraction buckets to mix in. A list of
+            ``{"without_distraction", "with_distraction"}`` — the cap applies per
+            bucket, so ``["without_distraction", "with_distraction"]`` with
+            ``num_human_demos_per_task=80`` yields 80 demos from each bucket.
         **kwargs: Forwarded to :class:`BaseDataset` (``train``, ``resolution``,
             ``idm_resolution``, ``depth_processor``, horizon args, ...).
     """
@@ -83,7 +87,7 @@ class LfOBenchmarkDataset(BaseDataset):
         human_cameras=("front",),
         num_robot_demos_per_task=None,
         num_human_demos_per_task=None,
-        human_distract: bool = False,
+        include_video_types=("without_distraction",),
         **kwargs,
     ):
         self.tasks = list(tasks) if tasks is not None else None
@@ -91,7 +95,13 @@ class LfOBenchmarkDataset(BaseDataset):
         self.human_cameras = list(human_cameras)
         self.num_robot_demos_per_task = num_robot_demos_per_task
         self.num_human_demos_per_task = num_human_demos_per_task
-        self.human_distract = bool(human_distract)
+        self.include_video_types = list(include_video_types)
+        bad = [v for v in self.include_video_types if v not in VALID_VIDEO_TYPES]
+        if bad or not self.include_video_types:
+            raise ValueError(
+                f"include_video_types must be a non-empty subset of {VALID_VIDEO_TYPES}; "
+                f"got {self.include_video_types!r}."
+            )
         # Default horizon range — robot trajectories are 139-459 frames, human videos
         # are ~30-100, so 10-30 fits both. Callers can override via kwargs.
         kwargs.setdefault("min_predict_future_horizon", 10)
@@ -104,11 +114,13 @@ class LfOBenchmarkDataset(BaseDataset):
 
     def _prepare_data(self, data_path):
         robot_samples_root = Path(data_path) / ROBOT_SAMPLES_SUBDIR
-        human_root = Path(data_path) / HUMAN_SUBDIR / HUMAN_DISTRACT_DIRS[self.human_distract]
+        human_base = Path(data_path) / HUMAN_SUBDIR
 
         robot_index = self._load_robot_sample_index(robot_samples_root)
         robot_tasks = set(robot_index.keys())
-        human_tasks = _list_subdirs(human_root)
+        human_tasks = set()
+        for video_type in self.include_video_types:
+            human_tasks |= _list_subdirs(human_base / video_type)
 
         if self.tasks is None:
             tasks = sorted(robot_tasks & human_tasks)
@@ -117,11 +129,12 @@ class LfOBenchmarkDataset(BaseDataset):
         if not tasks:
             raise ValueError(
                 f"No tasks resolved. robot_samples_root={robot_samples_root!r} has "
-                f"{sorted(robot_tasks)}, human_root={human_root!r} has {sorted(human_tasks)}."
+                f"{sorted(robot_tasks)}, human_base={human_base!r} "
+                f"(video types {self.include_video_types}) has {sorted(human_tasks)}."
             )
 
         robot_entries = self._scan_robot(robot_samples_root, robot_index, tasks)
-        human_entries = self._scan_human(human_root, tasks)
+        human_entries = self._scan_human(human_base, tasks)
 
         # Per-source 90/10 train/val split so val has both sources.
         self.image_pair = _split(robot_entries, self.train) + _split(human_entries, self.train)
@@ -186,30 +199,36 @@ class LfOBenchmarkDataset(BaseDataset):
                     })
         return out
 
-    def _scan_human(self, human_root, tasks):
+    def _scan_human(self, human_base, tasks):
+        """One ``image_pair`` entry per (video type, demo, camera). The
+        ``num_human_demos_per_task`` cap is applied per video type."""
         out = []
-        for task in tasks:
-            task_dir = os.path.join(human_root, task)
-            if not os.path.isdir(task_dir):
-                continue
-            demo_names = sorted(
-                d for d in os.listdir(task_dir) if os.path.isdir(os.path.join(task_dir, d))
-            )
-            if self.num_human_demos_per_task is not None:
-                demo_names = demo_names[: self.num_human_demos_per_task]
-            for demo in demo_names:
-                demo_dir = os.path.join(task_dir, demo)
-                for cam in self.human_cameras:
-                    mp4 = os.path.join(demo_dir, f"{cam}.mp4")
-                    if not os.path.isfile(mp4):
-                        continue
-                    try:
-                        T = len(VideoReader(mp4, ctx=cpu(0)))
-                    except Exception:
-                        continue
-                    if T < self.min_predict_future_horizon:
-                        continue
-                    out.append({"path": mp4, "length": int(T), "source": "human", "camera": cam})
+        for video_type in self.include_video_types:
+            human_root = os.path.join(str(human_base), video_type)
+            for task in tasks:
+                task_dir = os.path.join(human_root, task)
+                if not os.path.isdir(task_dir):
+                    continue
+                demo_names = sorted(
+                    d for d in os.listdir(task_dir) if os.path.isdir(os.path.join(task_dir, d))
+                )
+                if self.num_human_demos_per_task is not None:
+                    demo_names = demo_names[: self.num_human_demos_per_task]
+                for demo in demo_names:
+                    demo_dir = os.path.join(task_dir, demo)
+                    for cam in self.human_cameras:
+                        mp4 = os.path.join(demo_dir, f"{cam}.mp4")
+                        if not os.path.isfile(mp4):
+                            continue
+                        try:
+                            T = len(VideoReader(mp4, ctx=cpu(0)))
+                        except Exception:
+                            continue
+                        if T < self.min_predict_future_horizon:
+                            continue
+                        out.append(
+                            {"path": mp4, "length": int(T), "source": "human", "camera": cam}
+                        )
         return out
 
     # ------------------------------------------------------------------
