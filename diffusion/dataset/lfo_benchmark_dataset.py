@@ -51,8 +51,24 @@ from .base_dataset import BaseDataset
 ROBOT_SAMPLES_SUBDIR = "postprocessed_robot_trajectories"
 #: Subdirectory holding raw human demonstration videos.
 HUMAN_SUBDIR = "raw_video_demonstrations"
-#: Human-demo distraction sub-buckets selectable via ``include_video_types``.
-VALID_VIDEO_TYPES = ("without_distraction", "with_distraction")
+#: Distraction sub-buckets selectable via ``include_video_types``. Filters both
+#: the robot index and the human video pool — both sides must come from the
+#: same bucket so the IDM doesn't accidentally learn cross-bucket invariants.
+VALID_VIDEO_TYPES = ("without_distraction", "with_distraction", "task_sequence")
+
+#: Buckets whose human-demo tree is flat (demos sit directly under the bucket
+#: dir, no per-task layer): currently ``task_sequence``.
+_FLAT_HUMAN_BUCKETS = frozenset({"task_sequence"})
+
+
+def _infer_entry_bucket(entry: dict) -> str:
+    """Fallback bucket label for legacy index entries lacking a "bucket" field."""
+    b = entry.get("bucket")
+    if b:
+        return b
+    if " and " in entry.get("task", ""):
+        return "task_sequence"
+    return "without_distraction"
 
 #: Cameras available for each source — used only for friendlier error messages.
 ROBOT_CAMERAS = ("base_camera", "hand_camera", "left_camera", "overhead_camera", "right_camera")
@@ -116,37 +132,51 @@ class LfOBenchmarkDataset(BaseDataset):
         robot_samples_root = Path(data_path) / ROBOT_SAMPLES_SUBDIR
         human_base = Path(data_path) / HUMAN_SUBDIR
 
+        # robot_index: {bucket: {task: {demo_id: [sample_idx, ...]}}}
         robot_index = self._load_robot_sample_index(robot_samples_root)
-        robot_tasks = set(robot_index.keys())
-        human_tasks = set()
-        for video_type in self.include_video_types:
-            human_tasks |= _list_subdirs(human_base / video_type)
 
-        if self.tasks is None:
-            tasks = sorted(robot_tasks & human_tasks)
-        else:
-            tasks = list(self.tasks)
-        if not tasks:
+        # Per-bucket task selection. For per-task buckets we intersect robot
+        # and human task names; for flat buckets (task_sequence) there is no
+        # task layer on the human side, so we keep all robot tasks in that
+        # bucket and emit human demos directly from the bucket dir.
+        per_bucket_tasks: dict[str, list[str]] = {}
+        for bucket in self.include_video_types:
+            robot_tasks = set(robot_index.get(bucket, {}).keys())
+            if bucket in _FLAT_HUMAN_BUCKETS:
+                tasks = sorted(robot_tasks) if self.tasks is None else list(self.tasks)
+            else:
+                human_tasks = _list_subdirs(human_base / bucket)
+                if self.tasks is None:
+                    tasks = sorted(robot_tasks & human_tasks)
+                else:
+                    tasks = list(self.tasks)
+            per_bucket_tasks[bucket] = tasks
+
+        if not any(per_bucket_tasks.values()):
             raise ValueError(
-                f"No tasks resolved. robot_samples_root={robot_samples_root!r} has "
-                f"{sorted(robot_tasks)}, human_base={human_base!r} "
-                f"(video types {self.include_video_types}) has {sorted(human_tasks)}."
+                f"No tasks resolved for any bucket. robot_samples_root="
+                f"{robot_samples_root!r} buckets={list(robot_index.keys())}, "
+                f"human_base={human_base!r} video_types={self.include_video_types}."
             )
 
-        robot_entries = self._scan_robot(robot_samples_root, robot_index, tasks)
-        human_entries = self._scan_human(human_base, tasks)
+        robot_entries = self._scan_robot(robot_samples_root, robot_index, per_bucket_tasks)
+        human_entries = self._scan_human(human_base, per_bucket_tasks)
 
         # Per-source 90/10 train/val split so val has both sources.
         self.image_pair = _split(robot_entries, self.train) + _split(human_entries, self.train)
 
-    def _load_robot_sample_index(self, robot_samples_root: Path) -> dict[str, dict[str, list[int]]]:
+    def _load_robot_sample_index(
+        self, robot_samples_root: Path
+    ) -> dict[str, dict[str, dict[str, list[int]]]]:
         """Read ``postprocessed_robot_trajectories/meta/index.jsonl`` and group sample idxs by
-        ``(task, demo_id)``. Returns ``{task: {demo_id: [sorted sample_idx, ...]}}``.
+        ``(bucket, task, demo_id)``. Returns
+        ``{bucket: {task: {demo_id: [sorted sample_idx, ...]}}}``.
 
-        Each line of ``index.jsonl`` is ``{"idx", "task", "demo_id", "t"}``.
-        Within a demo, the time-axis index ``t`` is contiguous from 0 to
-        ``len(group) - 1`` (the preprocessor walks demos in t order), so the
-        sample-idx list is already ordered chronologically.
+        Bucket comes from the entry's ``"bucket"`` field (filled in by the
+        bucketed preprocessor); legacy entries without it fall back to
+        ``_infer_entry_bucket``. Filtering robot demos by bucket is Fix A's
+        precondition — without it we'd mix robot frames from a different
+        distraction setting into the IDM training set.
         """
         index_path = robot_samples_root / "meta" / "index.jsonl"
         if not index_path.is_file():
@@ -155,56 +185,100 @@ class LfOBenchmarkDataset(BaseDataset):
                 f"Run `scripts/process_training_trajectories.py --pi05-samples` "
                 f"first to materialize the per-sample pkl dataset."
             )
-        groups: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+        allowed = set(self.include_video_types)
+        groups: dict[str, dict[str, dict[str, list[int]]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
         with open(index_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 entry = json.loads(line)
-                groups[entry["task"]][entry["demo_id"]].append(int(entry["idx"]))
+                bucket = _infer_entry_bucket(entry)
+                if bucket not in allowed:
+                    continue
+                groups[bucket][entry["task"]][entry["demo_id"]].append(int(entry["idx"]))
         # Sort the per-demo idx lists so the group represents (t=0, t=1, …).
-        for task, demos in groups.items():
-            for demo_id, idxs in demos.items():
-                demos[demo_id] = sorted(idxs)
+        for bucket, by_task in groups.items():
+            for task, demos in by_task.items():
+                for demo_id, idxs in demos.items():
+                    demos[demo_id] = sorted(idxs)
         return groups
 
-    def _scan_robot(self, robot_samples_root: Path, index: dict, tasks):
-        """One ``image_pair`` entry per (demo, camera). ``path`` is the demo's
-        absolute pkl directory, ``length`` is the number of sample pkls in it,
-        and ``camera`` selects which ``observation/<cam>`` key to slice at
-        __getitem__ time.
+    def _scan_robot(self, robot_samples_root: Path, index: dict,
+                    per_bucket_tasks: dict[str, list[str]]):
+        """One ``image_pair`` entry per (bucket, demo, camera). ``path`` is the
+        demo's absolute pkl directory, ``length`` is the number of sample pkls
+        in it, and ``camera`` selects which ``observation/<cam>`` key to slice
+        at __getitem__ time.
         """
         out = []
         data_dir = robot_samples_root / "data"
-        for task in tasks:
-            demos = index.get(task, {})
-            demo_ids_sorted = sorted(demos.keys())
-            if self.num_robot_demos_per_task is not None:
-                demo_ids_sorted = demo_ids_sorted[: self.num_robot_demos_per_task]
-            for demo_id in demo_ids_sorted:
-                sample_idxs = demos[demo_id]
-                T = len(sample_idxs)
-                if T < self.min_predict_future_horizon:
-                    continue
-                for cam in self.robot_cameras:
-                    out.append({
-                        "path": str(data_dir),
-                        "length": T,
-                        "source": "robot",
-                        "camera": cam,
-                        "task": task,
-                        "demo_id": demo_id,
-                        "sample_idxs": sample_idxs,
-                    })
+        for bucket, tasks in per_bucket_tasks.items():
+            by_task = index.get(bucket, {})
+            for task in tasks:
+                demos = by_task.get(task, {})
+                demo_ids_sorted = sorted(demos.keys())
+                if self.num_robot_demos_per_task is not None:
+                    demo_ids_sorted = demo_ids_sorted[: self.num_robot_demos_per_task]
+                for demo_id in demo_ids_sorted:
+                    sample_idxs = demos[demo_id]
+                    T = len(sample_idxs)
+                    if T < self.min_predict_future_horizon:
+                        continue
+                    for cam in self.robot_cameras:
+                        out.append({
+                            "path": str(data_dir),
+                            "length": T,
+                            "source": "robot",
+                            "camera": cam,
+                            "bucket": bucket,
+                            "task": task,
+                            "demo_id": demo_id,
+                            "sample_idxs": sample_idxs,
+                        })
         return out
 
-    def _scan_human(self, human_base, tasks):
-        """One ``image_pair`` entry per (video type, demo, camera). The
-        ``num_human_demos_per_task`` cap is applied per video type."""
+    def _scan_human(self, human_base, per_bucket_tasks: dict[str, list[str]]):
+        """One ``image_pair`` entry per (bucket, demo, camera).
+
+        For per-task buckets we walk ``<human_base>/<bucket>/<task>/<demo>/<cam>.mp4``.
+        For flat buckets (``task_sequence``) the task layer is absent — demos
+        sit directly under the bucket — so we walk ``<human_base>/<bucket>/<demo>/``.
+        ``num_human_demos_per_task`` is applied per (bucket, task) for per-task
+        buckets, or per bucket for flat buckets.
+        """
         out = []
-        for video_type in self.include_video_types:
+        for video_type, tasks in per_bucket_tasks.items():
             human_root = os.path.join(str(human_base), video_type)
+            if video_type in _FLAT_HUMAN_BUCKETS:
+                if not os.path.isdir(human_root):
+                    continue
+                demo_names = sorted(
+                    d for d in os.listdir(human_root)
+                    if os.path.isdir(os.path.join(human_root, d))
+                )
+                if self.num_human_demos_per_task is not None:
+                    demo_names = demo_names[: self.num_human_demos_per_task]
+                for demo in demo_names:
+                    demo_dir = os.path.join(human_root, demo)
+                    for cam in self.human_cameras:
+                        mp4 = os.path.join(demo_dir, f"{cam}.mp4")
+                        if not os.path.isfile(mp4):
+                            continue
+                        try:
+                            T = len(VideoReader(mp4, ctx=cpu(0)))
+                        except Exception:
+                            continue
+                        if T < self.min_predict_future_horizon:
+                            continue
+                        out.append({
+                            "path": mp4, "length": int(T),
+                            "source": "human", "camera": cam,
+                            "bucket": video_type,
+                        })
+                continue
             for task in tasks:
                 task_dir = os.path.join(human_root, task)
                 if not os.path.isdir(task_dir):
@@ -226,9 +300,11 @@ class LfOBenchmarkDataset(BaseDataset):
                             continue
                         if T < self.min_predict_future_horizon:
                             continue
-                        out.append(
-                            {"path": mp4, "length": int(T), "source": "human", "camera": cam}
-                        )
+                        out.append({
+                            "path": mp4, "length": int(T),
+                            "source": "human", "camera": cam,
+                            "bucket": video_type,
+                        })
         return out
 
     # ------------------------------------------------------------------
