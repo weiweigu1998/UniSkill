@@ -118,10 +118,13 @@ class LfOBenchmarkDataset(BaseDataset):
                 f"include_video_types must be a non-empty subset of {VALID_VIDEO_TYPES}; "
                 f"got {self.include_video_types!r}."
             )
-        # Default horizon range — robot trajectories are 139-459 frames, human videos
-        # are ~30-100, so 10-30 fits both. Callers can override via kwargs.
-        kwargs.setdefault("min_predict_future_horizon", 10)
-        kwargs.setdefault("max_predict_future_horizon", 30)
+        # Default horizon range — matches the UniSkill paper's stage-1 recipe
+        # (Table 8a: k sampled from [20, 40]). Our shortest human demo is 84
+        # frames (without_distraction), well above 40, so this range is safe
+        # for every demo we have. Callers can override via kwargs if a smaller
+        # range is needed (e.g. for a new bucket with very short videos).
+        kwargs.setdefault("min_predict_future_horizon", 20)
+        kwargs.setdefault("max_predict_future_horizon", 40)
         super().__init__(data_path, **kwargs)
 
     # ------------------------------------------------------------------
