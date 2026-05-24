@@ -122,6 +122,30 @@ def parse_args(input_args=None):
         "If provided, overrides num_train_epochs.",
     )
     parser.add_argument(
+        "--idm_init",
+        type=str,
+        default=None,
+        help=(
+            "Path to a pretrained UniSkill ISD/IDM .pth (i.e. "
+            "/root/checkpoints/pretrained_uniskill/idm.pth). If set, the "
+            "IDM module is loaded from this checkpoint before training "
+            "begins so the run becomes a finetune of the pretrained "
+            "embodiment-agnostic skill encoder instead of a from-scratch "
+            "train. The U-Net (FSD) is still initialised from "
+            "--pretrained_model_name_or_path."
+        ),
+    )
+    parser.add_argument(
+        "--logging_steps",
+        type=int,
+        default=0,
+        help=(
+            "If >0, print an explicit '[step S/T] loss=… lr=…' line every "
+            "N optimiser steps in addition to the tqdm progress bar — easier "
+            "to grep from the saved dag log."
+        ),
+    )
+    parser.add_argument(
         "--checkpointing_steps",
         type=int,
         default=1000,
@@ -755,6 +779,20 @@ def main(args):
         out_dim=unet.config.cross_attention_dim,
         idm_resolution=args.idm_resolution,
     )
+    # Optional: warm-start the IDM (ISD) from a pretrained checkpoint so this
+    # run is a finetune of the embodiment-agnostic skill encoder instead of
+    # a from-scratch train. The FSD U-Net is independently warm-started from
+    # ``--pretrained_model_name_or_path`` (usually timbrooks/instruct-pix2pix),
+    # so this flag covers the matching ISD side of the recipe.
+    if args.idm_init:
+        if not os.path.isfile(args.idm_init):
+            raise FileNotFoundError(f"--idm_init not found: {args.idm_init}")
+        state_dict = torch.load(args.idm_init, map_location="cpu")
+        missing, unexpected = idm.load_state_dict(state_dict, strict=False)
+        logger.info(
+            f"[idm_init] loaded ISD weights from {args.idm_init}; "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1156,6 +1194,16 @@ def main(args):
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
+            # Explicit, grep-friendly per-N-step log line that lives in the
+            # saved dag log (tqdm's set_postfix overwrites in-place via \r so
+            # log scrapers can't recover the per-step trace from it).
+            if args.logging_steps and global_step > 0 and \
+                    global_step % args.logging_steps == 0 and \
+                    accelerator.sync_gradients and \
+                    accelerator.is_main_process:
+                print(f"[idm] step {global_step}/{args.max_train_steps}  "
+                      f"loss={logs['loss']:.6f}  lr={logs['lr']:.3e}",
+                      flush=True)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
